@@ -1,0 +1,408 @@
+# playbook.yml
+---
+- name: Deploy Matrix Synapse with ZFS Optimization on FreeBSD
+  hosts: all
+  become: true
+  
+  vars:
+    # User-provided variables
+    synapse_hostname: "{{ subdomain }}.{{ domain_name }}"
+    synapse_config_dir: /usr/local/etc/matrix-synapse
+    synapse_data_dir: /var/db/matrix-synapse
+    synapse_log_dir: /var/log/matrix-synapse
+    synapse_run_dir: /var/run/matrix-synapse
+    postgres_data_dir: /var/db/postgres/data17
+
+  tasks:
+    # ============================================
+    # ZFS Configuration
+    # ============================================
+    - name: Check if ZFS pool exists
+      ansible.builtin.command: zpool list datapool
+      register: zpool_check
+      failed_when: false
+      changed_when: false
+
+    - name: Create ZFS pool and datasets
+      when: zpool_check.rc != 0
+      block:
+        - name: Create ZFS pool
+          ansible.builtin.command: zpool create -f datapool /dev/da1
+
+        - name: Configure ZFS pool properties
+          ansible.builtin.command: zfs set atime=off datapool
+
+        - name: Create PostgreSQL dataset
+          ansible.builtin.shell: |
+            zfs create -o mountpoint=/var/db/postgres datapool/postgres
+            zfs set recordsize=8k datapool/postgres
+            zfs set primarycache=metadata datapool/postgres
+            zfs set logbias=throughput datapool/postgres
+
+        - name: Create Matrix Synapse dataset
+          ansible.builtin.command: >
+            zfs create -o mountpoint={{ synapse_data_dir }} datapool/matrix-synapse
+
+    - name: Set ARC limit for low memory system
+      ansible.builtin.lineinfile:
+        path: /boot/loader.conf
+        regexp: '^vfs\.zfs\.arc_max='
+        line: 'vfs.zfs.arc_max="512M"'
+        create: yes
+
+    # ============================================
+    # Package Installation
+    # ============================================
+    - name: Install required packages
+      community.general.pkgng:
+        name:
+          - postgresql17-server
+          - postgresql17-client
+          - py311-matrix-synapse
+          - py311-psycopg2
+          - caddy
+        state: present
+
+    # ============================================
+    # PostgreSQL Configuration
+    # ============================================
+    - name: Enable PostgreSQL
+      community.general.sysrc:
+        name: postgresql_enable
+        value: "YES"
+
+    - name: Check if PostgreSQL cluster exists
+      ansible.builtin.stat:
+        path: "{{ postgres_data_dir }}/PG_VERSION"
+      register: pg_version_file
+
+    - name: Initialize PostgreSQL cluster
+      ansible.builtin.command: /usr/local/etc/rc.d/postgresql initdb
+      when: not pg_version_file.stat.exists
+
+    - name: Configure PostgreSQL authentication
+      ansible.builtin.copy:
+        dest: "{{ postgres_data_dir }}/pg_hba.conf"
+        owner: postgres
+        group: postgres
+        mode: "0600"
+        content: |
+          # TYPE  DATABASE        USER            ADDRESS                 METHOD
+          local   all             postgres                                peer
+          host    synapse         synapse         127.0.0.1/32            scram-sha-256
+          host    synapse         synapse         ::1/128                 scram-sha-256
+          local   all             all                                     peer
+      notify: Restart PostgreSQL
+
+    - name: Tune PostgreSQL for low memory
+      ansible.builtin.copy:
+        dest: "{{ postgres_data_dir }}/conf.d/matrix.conf"
+        owner: postgres
+        group: postgres
+        mode: "0644"
+        content: |
+          # Memory settings for e2-micro (1GB RAM)
+          shared_buffers = 128MB
+          effective_cache_size = 256MB
+          work_mem = 4MB
+          maintenance_work_mem = 32MB
+          
+          # Connection settings
+          max_connections = 50
+          
+          # WAL settings
+          wal_buffers = 4MB
+          checkpoint_completion_target = 0.9
+      notify: Restart PostgreSQL
+
+    - name: Ensure conf.d is included in postgresql.conf
+      ansible.builtin.lineinfile:
+        path: "{{ postgres_data_dir }}/postgresql.conf"
+        regexp: "^include_dir"
+        line: "include_dir = 'conf.d'"
+      notify: Restart PostgreSQL
+
+    - name: Create conf.d directory
+      ansible.builtin.file:
+        path: "{{ postgres_data_dir }}/conf.d"
+        state: directory
+        owner: postgres
+        group: postgres
+        mode: "0700"
+
+    - name: Start PostgreSQL
+      ansible.builtin.service:
+        name: postgresql
+        state: started
+
+    - name: Flush handlers
+      ansible.builtin.meta: flush_handlers
+
+    - name: Create PostgreSQL user
+      become_user: postgres
+      community.postgresql.postgresql_user:
+        name: synapse
+        password: "{{ db_password }}"
+        role_attr_flags: CREATEDB
+
+    - name: Create PostgreSQL database
+      become_user: postgres
+      community.postgresql.postgresql_db:
+        name: synapse
+        owner: synapse
+        encoding: UTF-8
+        lc_collate: C
+        lc_ctype: C
+        template: template0
+
+    # ============================================
+    # Matrix Synapse Configuration
+    # ============================================
+    - name: Create Synapse directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: synapse
+        group: synapse
+        mode: "{{ item.mode | default('0755') }}"
+      loop:
+        - { path: "{{ synapse_config_dir }}" }
+        - { path: "{{ synapse_data_dir }}" }
+        - { path: "{{ synapse_data_dir }}/media_store" }
+        - { path: "{{ synapse_log_dir }}" }
+        - { path: "{{ synapse_run_dir }}" }
+
+    - name: Check if signing key exists
+      ansible.builtin.stat:
+        path: "{{ synapse_config_dir }}/{{ domain_name }}.signing.key"
+      register: signing_key
+
+    - name: Generate signing key
+      ansible.builtin.command: >
+        su -m synapse -c
+        'python3 -m synapse.app.homeserver
+        --server-name {{ domain_name }}
+        --config-path {{ synapse_config_dir }}/homeserver.yaml
+        --generate-keys
+        --keys-directory {{ synapse_config_dir }}'
+      when: not signing_key.stat.exists
+
+    - name: Configure homeserver.yaml
+      ansible.builtin.copy:
+        dest: "{{ synapse_config_dir }}/homeserver.yaml"
+        owner: synapse
+        group: synapse
+        mode: "0640"
+        content: |
+          # Server identification
+          server_name: "{{ domain_name }}"
+          public_baseurl: "https://{{ synapse_hostname }}/"
+          pid_file: {{ synapse_run_dir }}/homeserver.pid
+          
+          # Listeners
+          listeners:
+            - port: 8008
+              tls: false
+              type: http
+              x_forwarded: true
+              bind_addresses: ['127.0.0.1']
+              resources:
+                - names: [client, federation]
+                  compress: false
+          
+          # Database
+          database:
+            name: psycopg2
+            args:
+              user: synapse
+              password: "{{ db_password }}"
+              host: 127.0.0.1
+              database: synapse
+              cp_min: 3
+              cp_max: 5
+          
+          # Paths
+          log_config: "{{ synapse_config_dir }}/log_config.yaml"
+          media_store_path: "{{ synapse_data_dir }}/media_store"
+          signing_key_path: "{{ synapse_config_dir }}/{{ domain_name }}.signing.key"
+          
+          # Secrets
+          registration_shared_secret: "{{ synapse_registration_shared_secret }}"
+          macaroon_secret_key: "{{ synapse_macaroon_secret_key }}"
+          form_secret: "{{ synapse_form_secret }}"
+          
+          # Registration & federation
+          enable_registration: false
+          report_stats: false
+          
+          trusted_key_servers:
+            - server_name: "matrix.org"
+          
+          # Resource limits for e2-micro
+          federation_rr_transactions_per_room_per_second: 10
+          
+          # Caching (reduced for low memory)
+          caches:
+            global_factor: 0.5
+      notify: Restart Matrix Synapse
+
+    - name: Configure logging
+      ansible.builtin.copy:
+        dest: "{{ synapse_config_dir }}/log_config.yaml"
+        owner: synapse
+        group: synapse
+        mode: "0644"
+        content: |
+          version: 1
+          formatters:
+            precise:
+              format: '%(asctime)s - %(name)s - %(lineno)d - %(levelname)s - %(request)s - %(message)s'
+          handlers:
+            file:
+              class: logging.handlers.TimedRotatingFileHandler
+              formatter: precise
+              filename: {{ synapse_log_dir }}/homeserver.log
+              when: midnight
+              backupCount: 3
+              encoding: utf8
+          root:
+            handlers: [file]
+            level: INFO
+          loggers:
+            synapse.storage.SQL:
+              level: WARNING
+            synapse.access.http:
+              level: WARNING
+      notify: Restart Matrix Synapse
+
+    - name: Enable Matrix Synapse
+      community.general.sysrc:
+        name: synapse_enable
+        value: "YES"
+
+    - name: Start Matrix Synapse
+      ansible.builtin.service:
+        name: synapse
+        state: started
+
+    # ============================================
+    # Caddy Configuration
+    # ============================================
+    - name: Configure Caddyfile
+      ansible.builtin.copy:
+        dest: /usr/local/etc/caddy/Caddyfile
+        owner: root
+        group: wheel
+        mode: "0644"
+        content: |
+          {
+              email {{ admin_email | default('admin@' + domain_name) }}
+          }
+          
+          # Main domain - .well-known delegation
+          {{ domain_name }} {
+              handle /.well-known/matrix/server {
+                  header Content-Type application/json
+                  respond `{"m.server":"{{ synapse_hostname }}:443"}`
+              }
+              
+              handle /.well-known/matrix/client {
+                  header Content-Type application/json
+                  header Access-Control-Allow-Origin *
+                  respond `{"m.homeserver":{"base_url":"https://{{ synapse_hostname }}"}}`
+              }
+              
+              handle {
+                  respond "{{ domain_name }}" 200
+              }
+          }
+          
+          # Matrix subdomain - actual Synapse service
+          {{ synapse_hostname }} {
+              handle /.well-known/matrix/server {
+                  header Content-Type application/json
+                  respond `{"m.server":"{{ synapse_hostname }}:443"}`
+              }
+              
+              handle /.well-known/matrix/client {
+                  header Content-Type application/json
+                  header Access-Control-Allow-Origin *
+                  respond `{"m.homeserver":{"base_url":"https://{{ synapse_hostname }}"}}`
+              }
+              
+              handle /_matrix/* {
+                  reverse_proxy 127.0.0.1:8008
+              }
+              
+              handle /_synapse/client/* {
+                  reverse_proxy 127.0.0.1:8008
+              }
+              
+              handle {
+                  respond "Matrix Synapse @ {{ synapse_hostname }}" 200
+              }
+          }
+          
+          # Federation port
+          {{ synapse_hostname }}:8448 {
+              reverse_proxy 127.0.0.1:8008
+          }
+      notify: Restart Caddy
+
+    - name: Enable Caddy
+      community.general.sysrc:
+        name: caddy_enable
+        value: "YES"
+
+    - name: Start Caddy
+      ansible.builtin.service:
+        name: caddy
+        state: started
+
+    # ============================================
+    # Verification
+    # ============================================
+    - name: Wait for Synapse
+      ansible.builtin.wait_for:
+        port: 8008
+        host: 127.0.0.1
+        timeout: 60
+
+    - name: Verify Synapse health
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:8008/_matrix/client/versions"
+        return_content: yes
+      register: synapse_health
+      failed_when: "'versions' not in synapse_health.content"
+
+    - name: Deployment summary
+      ansible.builtin.debug:
+        msg: |
+          ✓ Matrix Synapse deployed!
+          
+          Server name: {{ domain_name }}
+          Service URL: https://{{ synapse_hostname }}
+          User ID format: @user:{{ domain_name }}
+          
+          Create admin:
+            ssh {{ server_ip }}
+            register_new_matrix_user -c {{ synapse_config_dir }}/homeserver.yaml http://localhost:8008
+          
+          Test federation:
+            curl https://{{ synapse_hostname }}/.well-known/matrix/server
+
+  handlers:
+    - name: Restart PostgreSQL
+      ansible.builtin.service:
+        name: postgresql
+        state: restarted
+
+    - name: Restart Matrix Synapse
+      ansible.builtin.service:
+        name: synapse
+        state: restarted
+
+    - name: Restart Caddy
+      ansible.builtin.service:
+        name: caddy
+        state: restarted
