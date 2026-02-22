@@ -50,3 +50,7 @@ terraform.rc
 
 # group_vars and host_vars may contain sensitive data, so we ignore them by default.
 group_vars/all.yml
+inventory.yml
+
+### misc ###
+.secrets.json

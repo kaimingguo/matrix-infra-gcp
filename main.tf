@@ -99,7 +99,7 @@ resource "google_compute_instance" "matrix" {
   boot_disk {
     initialize_params {
       image = "freebsd-org-cloud-dev/freebsd-15-0-release-amd64-zfs"
-      size  = 10
+      size  = 22
     }
   }
 
@@ -132,6 +132,21 @@ resource "google_compute_instance" "matrix" {
       runcmd:
         - ln -sf /usr/local/bin/python3.11 /usr/local/bin/python3
     EOT
+    startup-script = <<-EOT
+      #!/bin/sh
+      # FreeBSD 15 ZFS image: sshd fails during boot due to a race condition.
+      # Wait for boot to settle, then ensure sshd is running.
+      sleep 30
+      if ! service sshd status > /dev/null 2>&1; then
+        logger -t startup-script "sshd not running after boot, restarting..."
+        service sshd restart
+      fi
+      # Install Python if cloud-init didn't run
+      if ! command -v python3 > /dev/null 2>&1; then
+        pkg install -y python311 py311-packaging bash
+        ln -sf /usr/local/bin/python3.11 /usr/local/bin/python3
+      fi
+    EOT
   }
 
   allow_stopping_for_update = true
@@ -140,16 +155,6 @@ resource "google_compute_instance" "matrix" {
 # ============================================
 # Cloudflare DNS
 # ============================================
-resource "cloudflare_dns_record" "matrix_root" {
-  zone_id = var.cloudflare_zone_id
-  name    = var.domain_name
-  ttl     = 3600
-  type    = "A"
-  comment = "Matrix Synapse root domain"
-  content = google_compute_address.matrix.address
-  proxied = false
-}
-
 resource "cloudflare_dns_record" "matrix_subdomain" {
   zone_id = var.cloudflare_zone_id
   name    = var.subdomain
@@ -216,9 +221,21 @@ resource "null_resource" "ansible_provision" {
 
   provisioner "local-exec" {
     command = <<-EOT
-      echo "Waiting for SSH..."
-      sleep 45
-      
+      echo "Waiting for SSH to become available..."
+      for i in $(seq 1 30); do
+        if ssh -o StrictHostKeyChecking=no -o IdentitiesOnly=yes -o ConnectTimeout=5 -o BatchMode=yes \
+          -i ${var.ssh_private_key} ${var.ssh_user}@${google_compute_address.matrix.address} 'echo ready' 2>/dev/null; then
+          echo "SSH is ready after ~$((i * 10)) seconds"
+          break
+        fi
+        if [ "$i" -eq 30 ]; then
+          echo "ERROR: SSH not available after 5 minutes"
+          exit 1
+        fi
+        echo "  Attempt $i/30 - retrying in 10s..."
+        sleep 10
+      done
+
       ansible-playbook \
         -i inventory.yml \
         --private-key ${var.ssh_private_key} \
@@ -249,6 +266,23 @@ output "matrix_url" {
 output "user_id_format" {
   value       = "@user:${var.domain_name}"
   description = "Matrix user ID format"
+}
+
+output "nginx_well_known_config" {
+  value       = <<-EOT
+    # Add to nginx server block for ${var.domain_name}
+    location /.well-known/matrix/server {
+        default_type application/json;
+        return 200 '{"m.server":"${local.synapse_hostname}:443"}';
+    }
+
+    location /.well-known/matrix/client {
+        default_type application/json;
+        add_header Access-Control-Allow-Origin *;
+        return 200 '{"m.homeserver":{"base_url":"https://${local.synapse_hostname}"}}';
+    }
+  EOT
+  description = "Nginx config for .well-known Matrix delegation on the root domain"
 }
 
 output "federation_test" {

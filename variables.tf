@@ -19,7 +19,7 @@ variable "zone" {
 variable "machine_type" {
   description = "GCP machine type"
   type        = string
-  default     = "e2-small" # e2-micro 對 Synapse 太小
+  default     = "e2-small"
 }
 
 variable "data_disk_size" {

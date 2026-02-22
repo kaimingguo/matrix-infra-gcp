@@ -94,6 +94,14 @@
           local   all             all                                     peer
       notify: Restart PostgreSQL
 
+    - name: Create PostgreSQL conf.d directory
+      ansible.builtin.file:
+        path: "{{ postgres_data_dir }}/conf.d"
+        state: directory
+        owner: postgres
+        group: postgres
+        mode: "0755"
+
     - name: Tune PostgreSQL for low memory
       ansible.builtin.copy:
         dest: "{{ postgres_data_dir }}/conf.d/matrix.conf"
@@ -172,6 +180,65 @@
         - { path: "{{ synapse_log_dir }}" }
         - { path: "{{ synapse_run_dir }}" }
 
+    - name: Configure homeserver.yaml
+      ansible.builtin.copy:
+        dest: "{{ synapse_config_dir }}/homeserver.yaml"
+        owner: synapse
+        group: synapse
+        mode: "0640"
+        content: |
+          # Server identification
+          server_name: "{{ domain_name }}"
+          public_baseurl: "https://{{ synapse_hostname }}/"
+          pid_file: {{ synapse_run_dir }}/homeserver.pid
+
+          # Listeners
+          listeners:
+            - port: 8008
+              tls: false
+              type: http
+              x_forwarded: true
+              bind_addresses: ['127.0.0.1']
+              resources:
+                - names: [client, federation]
+                  compress: false
+
+          # Database
+          database:
+            name: psycopg2
+            args:
+              user: synapse
+              password: "{{ db_password }}"
+              host: 127.0.0.1
+              database: synapse
+              cp_min: 3
+              cp_max: 5
+
+          # Paths
+          log_config: "{{ synapse_config_dir }}/log_config.yaml"
+          media_store_path: "{{ synapse_data_dir }}/media_store"
+          signing_key_path: "{{ synapse_config_dir }}/{{ domain_name }}.signing.key"
+
+          # Secrets
+          registration_shared_secret: "{{ synapse_registration_shared_secret }}"
+          macaroon_secret_key: "{{ synapse_macaroon_secret_key }}"
+          form_secret: "{{ synapse_form_secret }}"
+
+          # Registration & federation
+          enable_registration: false
+          report_stats: false
+
+          trusted_key_servers:
+            - server_name: "matrix.org"
+
+          # Resource limits for e2-micro
+          federation_rr_transactions_per_room_per_second: 10
+
+          # Caching (reduced for low memory)
+          caches:
+            global_factor: 0.5
+      notify: Restart Matrix Synapse
+
     - name: Check if signing key exists
       ansible.builtin.stat:
         path: "{{ synapse_config_dir }}/{{ domain_name }}.signing.key"
@@ -186,65 +253,6 @@
         --generate-keys
         --keys-directory {{ synapse_config_dir }}'
       when: not signing_key.stat.exists
-
-    - name: Configure homeserver.yaml
-      ansible.builtin.copy:
-        dest: "{{ synapse_config_dir }}/homeserver.yaml"
-        owner: synapse
-        group: synapse
-        mode: "0640"
-        content: |
-          # Server identification
-          server_name: "{{ domain_name }}"
-          public_baseurl: "https://{{ synapse_hostname }}/"
-          pid_file: {{ synapse_run_dir }}/homeserver.pid
-          
-          # Listeners
-          listeners:
-            - port: 8008
-              tls: false
-              type: http
-              x_forwarded: true
-              bind_addresses: ['127.0.0.1']
-              resources:
-                - names: [client, federation]
-                  compress: false
-          
-          # Database
-          database:
-            name: psycopg2
-            args:
-              user: synapse
-              password: "{{ db_password }}"
-              host: 127.0.0.1
-              database: synapse
-              cp_min: 3
-              cp_max: 5
-          
-          # Paths
-          log_config: "{{ synapse_config_dir }}/log_config.yaml"
-          media_store_path: "{{ synapse_data_dir }}/media_store"
-          signing_key_path: "{{ synapse_config_dir }}/{{ domain_name }}.signing.key"
-          
-          # Secrets
-          registration_shared_secret: "{{ synapse_registration_shared_secret }}"
-          macaroon_secret_key: "{{ synapse_macaroon_secret_key }}"
-          form_secret: "{{ synapse_form_secret }}"
-          
-          # Registration & federation
-          enable_registration: false
-          report_stats: false
-          
-          trusted_key_servers:
-            - server_name: "matrix.org"
-          
-          # Resource limits for e2-micro
-          federation_rr_transactions_per_room_per_second: 10
-          
-          # Caching (reduced for low memory)
-          caches:
-            global_factor: 0.5
-      notify: Restart Matrix Synapse
 
     - name: Configure logging
       ansible.builtin.copy:
@@ -299,25 +307,7 @@
               email {{ admin_email | default('admin@' + domain_name) }}
           }
           
-          # Main domain - .well-known delegation
-          {{ domain_name }} {
-              handle /.well-known/matrix/server {
-                  header Content-Type application/json
-                  respond `{"m.server":"{{ synapse_hostname }}:443"}`
-              }
-              
-              handle /.well-known/matrix/client {
-                  header Content-Type application/json
-                  header Access-Control-Allow-Origin *
-                  respond `{"m.homeserver":{"base_url":"https://{{ synapse_hostname }}"}}`
-              }
-              
-              handle {
-                  respond "{{ domain_name }}" 200
-              }
-          }
-          
-          # Matrix subdomain - actual Synapse service
+          # Matrix subdomain - Synapse service
           {{ synapse_hostname }} {
               handle /.well-known/matrix/server {
                   header Content-Type application/json
