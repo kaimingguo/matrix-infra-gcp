@@ -2,7 +2,7 @@
 # Data Sources
 # ============================================
 data "http" "my_ip" {
-  url = "https://api4.ipify.org"
+  url = "https://ifconfig.me/ip"
 }
 
 # ============================================
