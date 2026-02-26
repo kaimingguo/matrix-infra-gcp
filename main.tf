@@ -1,8 +1,14 @@
 # ============================================
-# Data Sources
+# GCP APIs
 # ============================================
-data "http" "my_ip" {
-  url = "https://ifconfig.me/ip"
+resource "google_project_service" "iap" {
+  service            = "iap.googleapis.com"
+  disable_on_destroy = false
+}
+
+resource "google_project_service" "secretmanager" {
+  service            = "secretmanager.googleapis.com"
+  disable_on_destroy = false
 }
 
 # ============================================
@@ -57,8 +63,8 @@ resource "google_compute_firewall" "matrix_ingress" {
   source_ranges = ["0.0.0.0/0"]
 }
 
-resource "google_compute_firewall" "ssh" {
-  name    = "matrix-allow-ssh"
+resource "google_compute_firewall" "ssh_iap" {
+  name    = "matrix-allow-ssh-iap"
   network = google_compute_network.matrix.name
 
   allow {
@@ -67,15 +73,31 @@ resource "google_compute_firewall" "ssh" {
   }
 
   target_tags   = ["matrix-server"]
-  source_ranges = ["${chomp(data.http.my_ip.response_body)}/32"]
+  source_ranges = ["35.235.240.0/20"] # GCP IAP TCP forwarding range
+}
+
+# ============================================
+# IAP Access
+# ============================================
+resource "google_project_iam_member" "iap_tunnel_user" {
+  project = var.gcp_project_id
+  role    = "roles/iap.tunnelResourceAccessor"
+  member  = "serviceAccount:${google_service_account.matrix.email}"
+}
+
+resource "google_project_iam_member" "iap_tunnel_self" {
+  project = var.gcp_project_id
+  role    = "roles/iap.tunnelResourceAccessor"
+  member  = "user:${var.admin_email}"
 }
 
 # ============================================
 # GCP Compute
 # ============================================
 resource "google_compute_address" "matrix" {
-  name   = "matrix-ip"
-  region = var.region
+  name         = "matrix-ip"
+  region       = var.region
+  network_tier = var.network_tier
 }
 
 resource "google_compute_disk" "matrix_data" {
@@ -111,7 +133,8 @@ resource "google_compute_instance" "matrix" {
   network_interface {
     subnetwork = google_compute_subnetwork.matrix.id
     access_config {
-      nat_ip = google_compute_address.matrix.address
+      nat_ip       = google_compute_address.matrix.address
+      network_tier = var.network_tier
     }
   }
 
@@ -121,8 +144,8 @@ resource "google_compute_instance" "matrix" {
   }
 
   metadata = {
-    ssh-keys  = "${var.ssh_user}:${file(var.ssh_pub_key)}"
-    user-data = <<-EOT
+    ssh-keys       = "${var.ssh_user}:${file(var.ssh_pub_key)}"
+    user-data      = <<-EOT
       #cloud-config
       pkg_bootstrap: true
       packages:
@@ -173,32 +196,57 @@ resource "local_file" "ansible_inventory" {
     all:
       hosts:
         matrix:
-          ansible_host: ${google_compute_address.matrix.address}
+          ansible_host: ${google_compute_instance.matrix.name}
           ansible_user: ${var.ssh_user}
           ansible_python_interpreter: /usr/local/bin/python3
+          ansible_ssh_common_args: >-
+            -o StrictHostKeyChecking=no
+            -o IdentitiesOnly=yes
+            -o ProxyCommand="gcloud compute start-iap-tunnel %h %p
+            --listen-on-stdin
+            --project=${var.gcp_project_id}
+            --zone=${var.zone}"
   EOT
 }
 
 resource "local_file" "ansible_vars" {
   filename = "${path.module}/group_vars/all.yml"
   content = templatefile("${path.module}/group_vars/all.yml.tftpl", {
-    server_ip                          = google_compute_address.matrix.address
-    domain_name                        = var.domain_name
-    subdomain                          = var.subdomain
-    db_password                        = local.secrets.db_password
-    synapse_registration_shared_secret = local.secrets.synapse_registration_shared_secret
-    synapse_macaroon_secret_key        = local.secrets.synapse_macaroon_secret_key
-    synapse_form_secret                = local.secrets.synapse_form_secret
-    admin_email                        = var.admin_email
+    server_ip      = google_compute_address.matrix.address
+    gcp_project_id = var.gcp_project_id
+    domain_name    = var.domain_name
+    subdomain      = var.subdomain
+    admin_email    = var.admin_email
   })
 
   file_permission = "0600"
 }
 
-resource "local_sensitive_file" "secrets_backup" {
-  filename        = "${path.module}/.secrets.json"
-  content         = jsonencode(local.secrets)
-  file_permission = "0600"
+# ============================================
+# GCP Secret Manager
+# ============================================
+resource "google_secret_manager_secret" "matrix" {
+  for_each  = local.secrets
+  secret_id = "matrix-${replace(each.key, "_", "-")}"
+
+  replication {
+    auto {}
+  }
+
+  depends_on = [google_project_service.secretmanager]
+}
+
+resource "google_secret_manager_secret_version" "matrix" {
+  for_each    = local.secrets
+  secret      = google_secret_manager_secret.matrix[each.key].id
+  secret_data = each.value
+}
+
+resource "google_secret_manager_secret_iam_member" "matrix_accessor" {
+  for_each  = local.secrets
+  secret_id = google_secret_manager_secret.matrix[each.key].secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.matrix.email}"
 }
 
 # ============================================
@@ -207,7 +255,8 @@ resource "local_sensitive_file" "secrets_backup" {
 resource "null_resource" "ansible_provision" {
   depends_on = [
     google_compute_instance.matrix,
-    google_compute_firewall.ssh,
+    google_compute_firewall.ssh_iap,
+    google_project_service.iap,
     cloudflare_dns_record.matrix_subdomain,
     local_file.ansible_inventory,
     local_file.ansible_vars,
@@ -221,15 +270,20 @@ resource "null_resource" "ansible_provision" {
 
   provisioner "local-exec" {
     command = <<-EOT
-      echo "Waiting for SSH to become available..."
+      echo "Waiting for SSH via IAP to become available..."
       for i in $(seq 1 30); do
-        if ssh -o StrictHostKeyChecking=no -o IdentitiesOnly=yes -o ConnectTimeout=5 -o BatchMode=yes \
-          -i ${var.ssh_private_key} ${var.ssh_user}@${google_compute_address.matrix.address} 'echo ready' 2>/dev/null; then
-          echo "SSH is ready after ~$((i * 10)) seconds"
+        if gcloud compute ssh ${var.ssh_user}@${google_compute_instance.matrix.name} \
+          --project=${var.gcp_project_id} \
+          --zone=${var.zone} \
+          --tunnel-through-iap \
+          --ssh-key-file=${var.ssh_private_key} \
+          --strict-host-key-checking=no \
+          --command='echo ready' 2>/dev/null; then
+          echo "SSH via IAP is ready after ~$((i * 10)) seconds"
           break
         fi
         if [ "$i" -eq 30 ]; then
-          echo "ERROR: SSH not available after 5 minutes"
+          echo "ERROR: SSH via IAP not available after 5 minutes"
           exit 1
         fi
         echo "  Attempt $i/30 - retrying in 10s..."
@@ -239,7 +293,6 @@ resource "null_resource" "ansible_provision" {
       ansible-playbook \
         -i inventory.yml \
         --private-key ${var.ssh_private_key} \
-        --ssh-extra-args='-o StrictHostKeyChecking=no -o IdentitiesOnly=yes' \
         playbook.yml
     EOT
 
@@ -290,7 +343,12 @@ output "federation_test" {
   description = "Command to test federation"
 }
 
+output "ssh_command" {
+  value       = "gcloud compute ssh ${var.ssh_user}@${google_compute_instance.matrix.name} --project=${var.gcp_project_id} --zone=${var.zone} --tunnel-through-iap"
+  description = "SSH into the Matrix server via IAP"
+}
+
 output "create_admin_command" {
-  value       = "ssh ${var.ssh_user}@${google_compute_address.matrix.address} 'register_new_matrix_user -c /usr/local/etc/matrix-synapse/homeserver.yaml http://localhost:8008'"
+  value       = "gcloud compute ssh ${var.ssh_user}@${google_compute_instance.matrix.name} --project=${var.gcp_project_id} --zone=${var.zone} --tunnel-through-iap -- 'register_new_matrix_user -c /usr/local/etc/matrix-synapse/homeserver.yaml http://localhost:8008'"
   description = "Command to create admin user"
 }

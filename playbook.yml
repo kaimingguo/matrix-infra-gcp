@@ -13,6 +13,36 @@
     synapse_run_dir: /var/run/matrix-synapse
     postgres_data_dir: /var/db/postgres/data17
 
+  pre_tasks:
+    # ============================================
+    # Fetch Secrets from GCP Secret Manager
+    # ============================================
+    - name: Fetch secrets from GCP Secret Manager
+      ansible.builtin.command: >
+        gcloud secrets versions access latest
+        --secret={{ item.secret }}
+        --project={{ gcp_project_id }}
+      delegate_to: localhost
+      become: false
+      changed_when: false
+      no_log: true
+      register: _secrets
+      loop:
+        - { secret: matrix-db-password, var: db_password }
+        - { secret: matrix-synapse-registration-shared-secret, var: synapse_registration_shared_secret }
+        - { secret: matrix-synapse-macaroon-secret-key, var: synapse_macaroon_secret_key }
+        - { secret: matrix-synapse-form-secret, var: synapse_form_secret }
+      loop_control:
+        label: "{{ item.secret }}"
+
+    - name: Set secret variables
+      ansible.builtin.set_fact:
+        "{{ item.item.var }}": "{{ item.stdout }}"
+      loop: "{{ _secrets.results }}"
+      loop_control:
+        label: "{{ item.item.var }}"
+      no_log: true
+
   tasks:
     # ============================================
     # ZFS Configuration

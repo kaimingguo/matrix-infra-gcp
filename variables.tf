@@ -28,6 +28,12 @@ variable "data_disk_size" {
   default     = 30
 }
 
+variable "network_tier" {
+  description = "GCP network tier"
+  type        = string
+  default     = "PREMIUM"
+}
+
 variable "domain_name" {
   description = "Root domain name (e.g., example.com)"
   type        = string
@@ -40,9 +46,8 @@ variable "subdomain" {
 }
 
 variable "admin_email" {
-  description = "Admin email for Let's Encrypt"
+  description = "Admin email for Let's Encrypt and IAP access"
   type        = string
-  default     = ""
 }
 
 variable "cloudflare_api_token" {
