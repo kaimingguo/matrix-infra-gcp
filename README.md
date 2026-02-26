@@ -10,6 +10,7 @@ Terraform + Ansible infrastructure for deploying a self-hosted [Matrix Synapse](
 - **Reverse proxy**: Caddy (automatic TLS via Let's Encrypt)
 - **DNS**: Cloudflare
 - **Secrets**: GCP Secret Manager (DB password, Synapse keys)
+- **Backup**: Daily PostgreSQL dumps to GCS with automatic lifecycle cleanup
 - **SSH access**: GCP Identity-Aware Proxy (IAP) tunneling — no public SSH port
 - **Provisioning**: Terraform creates infrastructure, Ansible configures the server
 
@@ -69,29 +70,59 @@ Internet ──▶ :443 ──▶ Caddy ──▶ :8008 Synapse           │
                   │                 │                     │
                   │            PostgreSQL 17              │
                   │          (ZFS recordsize=8k)          │
-                  │                                      │
+                  │                 │                     │
                   │   ┌──────────────────────────────┐   │
                   │   │  pd-standard (data disk)     │   │
                   │   │  datapool/postgres            │   │
                   │   │  datapool/matrix-synapse      │   │
                   │   └──────────────────────────────┘   │
-                  └──────────────────────────────────────┘
-                        ▲
-                        │ SSH via IAP tunnel (no public :22)
-                        │
-                  GCP Secret Manager
-                  (DB password, Synapse secrets)
+                  └──────────────┬───────────────────────┘
+                        ▲       │
+                        │       │ Daily pg_dump (03:00 UTC)
+                        │       ▼
+                  GCP Secret   GCS Bucket
+                  Manager      (30-day lifecycle)
+```
+
+## Backup
+
+A daily cron job at 03:00 UTC dumps the PostgreSQL database and uploads it to a GCS bucket.
+
+- **Format**: `pg_dump -Fc` (compressed custom format, supports `pg_restore`)
+- **GCS bucket**: `matrix-backups-<project-id>` with a 30-day lifecycle rule (configurable via `backup_gcs_retention_days`)
+- **Local retention**: 7 days in `/var/backups/postgres/`
+- **Auth**: GCP instance metadata server — no SDK or credentials file needed
+- **Log**: `/var/log/backup-postgres.log`
+
+Run manually:
+
+```sh
+/usr/local/bin/backup-postgres.sh
+```
+
+Restore from a backup:
+
+```sh
+# List available backups
+gcloud storage ls gs://matrix-backups-<project-id>/
+
+# Download
+gcloud storage cp gs://matrix-backups-<project-id>/synapse-20260226-030000.dump .
+
+# Restore (drop + recreate)
+pg_restore -U postgres -d synapse -c synapse-20260226-030000.dump
 ```
 
 ## Files
 
 | File | Purpose |
 |------|---------|
-| `main.tf` | GCP resources, Cloudflare DNS, Secret Manager, Ansible provisioner |
+| `main.tf` | GCP resources, Cloudflare DNS, Secret Manager, GCS backup bucket, Ansible provisioner |
 | `variables.tf` | Input variables with defaults |
 | `providers.tf` | Terraform provider configuration |
-| `playbook.yml` | Ansible playbook — ZFS, PostgreSQL, Synapse, Caddy |
+| `playbook.yml` | Ansible playbook — ZFS, PostgreSQL, Synapse, Caddy, backup cron |
 | `group_vars/all.yml.tftpl` | Ansible vars template (rendered by Terraform) |
+| `scripts/backup-postgres.sh` | PostgreSQL backup script (deployed to server by Ansible) |
 | `ansible.cfg` | Ansible settings (FreeBSD tmpfile workaround) |
 
 ## License

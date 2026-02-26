@@ -78,3 +78,9 @@ variable "ssh_private_key" {
   type        = string
   default     = "~/.ssh/id_ed25519"
 }
+
+variable "backup_gcs_retention_days" {
+  description = "Number of days to retain backups in GCS"
+  type        = number
+  default     = 30
+}

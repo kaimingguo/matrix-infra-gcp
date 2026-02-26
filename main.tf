@@ -188,6 +188,32 @@ resource "cloudflare_dns_record" "matrix_subdomain" {
 }
 
 # ============================================
+# GCS Backup Bucket
+# ============================================
+resource "google_storage_bucket" "backups" {
+  name          = "matrix-backups-${var.gcp_project_id}"
+  location      = var.region
+  storage_class = "STANDARD"
+
+  uniform_bucket_level_access = true
+
+  lifecycle_rule {
+    condition {
+      age = var.backup_gcs_retention_days
+    }
+    action {
+      type = "Delete"
+    }
+  }
+}
+
+resource "google_storage_bucket_iam_member" "backup_writer" {
+  bucket = google_storage_bucket.backups.name
+  role   = "roles/storage.objectAdmin"
+  member = "serviceAccount:${google_service_account.matrix.email}"
+}
+
+# ============================================
 # Ansible Configuration
 # ============================================
 resource "local_file" "ansible_inventory" {
@@ -217,6 +243,7 @@ resource "local_file" "ansible_vars" {
     domain_name    = var.domain_name
     subdomain      = var.subdomain
     admin_email    = var.admin_email
+    backup_bucket  = google_storage_bucket.backups.name
   })
 
   file_permission = "0600"

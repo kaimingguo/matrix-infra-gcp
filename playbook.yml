@@ -380,6 +380,36 @@
         state: started
 
     # ============================================
+    # PostgreSQL Backup
+    # ============================================
+    - name: Deploy backup script
+      ansible.builtin.copy:
+        src: scripts/backup-postgres.sh
+        dest: /usr/local/bin/backup-postgres.sh
+        mode: "0755"
+
+    - name: Set GCS bucket in backup script
+      ansible.builtin.lineinfile:
+        path: /usr/local/bin/backup-postgres.sh
+        regexp: '^GCS_BUCKET='
+        line: 'GCS_BUCKET="{{ backup_bucket }}"'
+
+    - name: Create backup log file
+      ansible.builtin.file:
+        path: /var/log/backup-postgres.log
+        state: touch
+        mode: "0644"
+      changed_when: false
+
+    - name: Schedule daily backup at 03:00 UTC
+      ansible.builtin.cron:
+        name: postgres-backup
+        minute: "0"
+        hour: "3"
+        job: "/usr/local/bin/backup-postgres.sh >> /var/log/backup-postgres.log 2>&1"
+        user: root
+
+    # ============================================
     # Verification
     # ============================================
     - name: Wait for Synapse
