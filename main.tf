@@ -25,6 +25,21 @@ resource "random_password" "synapse_secrets" {
   special = false
 }
 
+resource "random_password" "mautrix_telegram_db_password" {
+  length  = 32
+  special = false
+}
+
+resource "random_password" "mautrix_telegram_as_token" {
+  length  = 64
+  special = false
+}
+
+resource "random_password" "mautrix_telegram_hs_token" {
+  length  = 64
+  special = false
+}
+
 locals {
   synapse_hostname = "${var.subdomain}.${var.domain_name}"
   secrets = {
@@ -32,6 +47,12 @@ locals {
     synapse_registration_shared_secret = random_password.synapse_secrets[0].result
     synapse_macaroon_secret_key        = random_password.synapse_secrets[1].result
     synapse_form_secret                = random_password.synapse_secrets[2].result
+    mautrix_telegram_db_password       = random_password.mautrix_telegram_db_password.result
+    mautrix_telegram_as_token          = random_password.mautrix_telegram_as_token.result
+    mautrix_telegram_hs_token          = random_password.mautrix_telegram_hs_token.result
+    telegram_api_id                    = coalesce(var.telegram_api_id, "PLACEHOLDER")
+    telegram_api_hash                  = coalesce(var.telegram_api_hash, "PLACEHOLDER")
+    telegram_bot_token                 = coalesce(var.telegram_bot_token, "PLACEHOLDER")
   }
 }
 
@@ -238,12 +259,13 @@ resource "local_file" "ansible_inventory" {
 resource "local_file" "ansible_vars" {
   filename = "${path.module}/group_vars/all.yml"
   content = templatefile("${path.module}/group_vars/all.yml.tftpl", {
-    server_ip      = google_compute_address.matrix.address
-    gcp_project_id = var.gcp_project_id
-    domain_name    = var.domain_name
-    subdomain      = var.subdomain
-    admin_email    = var.admin_email
-    backup_bucket  = google_storage_bucket.backups.name
+    server_ip              = google_compute_address.matrix.address
+    gcp_project_id         = var.gcp_project_id
+    domain_name            = var.domain_name
+    subdomain              = var.subdomain
+    admin_email            = var.admin_email
+    backup_bucket          = google_storage_bucket.backups.name
+    enable_telegram_bridge = true
   })
 
   file_permission = "0600"
@@ -326,6 +348,7 @@ resource "null_resource" "ansible_provision" {
     environment = {
       ANSIBLE_HOST_KEY_CHECKING = "False"
       ANSIBLE_FORCE_COLOR       = "True"
+      PATH                      = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
     }
   }
 }

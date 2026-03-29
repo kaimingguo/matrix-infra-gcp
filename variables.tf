@@ -84,3 +84,25 @@ variable "backup_gcs_retention_days" {
   type        = number
   default     = 30
 }
+
+# ============================================
+# Telegram Bridge
+# ============================================
+variable "telegram_api_id" {
+  description = "Telegram API ID from https://my.telegram.org"
+  type        = string
+  sensitive   = true
+}
+
+variable "telegram_api_hash" {
+  description = "Telegram API hash from https://my.telegram.org"
+  type        = string
+  sensitive   = true
+}
+
+variable "telegram_bot_token" {
+  description = "Telegram bot token from @BotFather"
+  type        = string
+  sensitive   = true
+  default     = ""
+}

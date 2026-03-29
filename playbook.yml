@@ -32,6 +32,12 @@
         - { secret: matrix-synapse-registration-shared-secret, var: synapse_registration_shared_secret }
         - { secret: matrix-synapse-macaroon-secret-key, var: synapse_macaroon_secret_key }
         - { secret: matrix-synapse-form-secret, var: synapse_form_secret }
+        - { secret: matrix-mautrix-telegram-db-password, var: mautrix_telegram_db_password }
+        - { secret: matrix-mautrix-telegram-as-token, var: mautrix_telegram_as_token }
+        - { secret: matrix-mautrix-telegram-hs-token, var: mautrix_telegram_hs_token }
+        - { secret: matrix-telegram-api-id, var: telegram_api_id }
+        - { secret: matrix-telegram-api-hash, var: telegram_api_hash }
+        - { secret: matrix-telegram-bot-token, var: telegram_bot_token }
       loop_control:
         label: "{{ item.secret }}"
 
@@ -121,6 +127,8 @@
           local   all             postgres                                peer
           host    synapse         synapse         127.0.0.1/32            scram-sha-256
           host    synapse         synapse         ::1/128                 scram-sha-256
+          host    mautrix_telegram mautrix_telegram 127.0.0.1/32         scram-sha-256
+          host    mautrix_telegram mautrix_telegram ::1/128              scram-sha-256
           local   all             all                                     peer
       notify: Restart PostgreSQL
 
@@ -192,6 +200,27 @@
         lc_collate: C
         lc_ctype: C
         template: template0
+
+    # ============================================
+    # Mautrix-Telegram Database
+    # ============================================
+    - name: Create mautrix-telegram PostgreSQL user
+      become_user: postgres
+      community.postgresql.postgresql_user:
+        name: mautrix_telegram
+        password: "{{ mautrix_telegram_db_password }}"
+      when: enable_telegram_bridge | default(false) | bool
+
+    - name: Create mautrix-telegram PostgreSQL database
+      become_user: postgres
+      community.postgresql.postgresql_db:
+        name: mautrix_telegram
+        owner: mautrix_telegram
+        encoding: UTF-8
+        lc_collate: C
+        lc_ctype: C
+        template: template0
+      when: enable_telegram_bridge | default(false) | bool
 
     # ============================================
     # Matrix Synapse Configuration
@@ -267,6 +296,12 @@
           # Caching (reduced for low memory)
           caches:
             global_factor: 0.5
+          {% if enable_telegram_bridge | default(false) | bool %}
+
+          # Bridge appservice registrations
+          app_service_config_files:
+            - {{ synapse_config_dir }}/telegram-registration.yaml
+          {% endif %}
       notify: Restart Matrix Synapse
 
     - name: Check if signing key exists
@@ -322,6 +357,214 @@
       ansible.builtin.service:
         name: synapse
         state: started
+
+    # ============================================
+    # Mautrix-Telegram Bridge
+    # ============================================
+    - name: Install mautrix-telegram dependencies
+      community.general.pkgng:
+        name:
+          - py311-pip
+          - py311-pillow
+          - py311-cryptography
+          - py311-cffi
+          - file
+          - ffmpeg
+        state: present
+      when: enable_telegram_bridge | default(false) | bool
+
+    - name: Create mautrix-telegram system user
+      ansible.builtin.user:
+        name: mautrix-telegram
+        home: /var/db/mautrix-telegram
+        shell: /bin/sh
+        system: yes
+        create_home: yes
+      when: enable_telegram_bridge | default(false) | bool
+
+    - name: Create mautrix-telegram directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: mautrix-telegram
+        group: mautrix-telegram
+        mode: "0755"
+      loop:
+        - /usr/local/etc/mautrix-telegram
+        - /var/db/mautrix-telegram
+        - /var/log/mautrix-telegram
+        - /var/run/mautrix-telegram
+      when: enable_telegram_bridge | default(false) | bool
+
+    - name: Create Python venv for mautrix-telegram
+      ansible.builtin.command: python3.11 -m venv /var/db/mautrix-telegram/venv
+      args:
+        creates: /var/db/mautrix-telegram/venv/bin/python
+      become_user: mautrix-telegram
+      when: enable_telegram_bridge | default(false) | bool
+
+    - name: Install mautrix-telegram in venv
+      ansible.builtin.pip:
+        name:
+          - mautrix-telegram
+          - asyncpg
+          - phonenumbers
+          - pycryptodome
+          - python-magic
+          - pillow
+          - prometheus_client
+          - brotli
+          - aiodns
+        virtualenv: /var/db/mautrix-telegram/venv
+        state: latest
+      become_user: mautrix-telegram
+      when: enable_telegram_bridge | default(false) | bool
+
+    - name: Deploy mautrix-telegram config
+      ansible.builtin.copy:
+        dest: /usr/local/etc/mautrix-telegram/config.yaml
+        owner: mautrix-telegram
+        group: mautrix-telegram
+        mode: "0640"
+        content: |
+          homeserver:
+            address: http://127.0.0.1:8008
+            domain: {{ domain_name }}
+
+          appservice:
+            address: http://127.0.0.1:29317
+            hostname: 127.0.0.1
+            port: 29317
+            database: postgres://mautrix_telegram:{{ mautrix_telegram_db_password }}@127.0.0.1/mautrix_telegram
+
+            id: telegram
+            bot_username: telegrambot
+            as_token: "{{ mautrix_telegram_as_token }}"
+            hs_token: "{{ mautrix_telegram_hs_token }}"
+
+          bridge:
+            permissions:
+              "*": relaybot
+              "{{ domain_name }}": full
+              "@admin:{{ domain_name }}": admin
+            relaybot:
+              enabled: true
+
+          telegram:
+            api_id: {{ telegram_api_id }}
+            api_hash: {{ telegram_api_hash }}
+            bot_token: {{ telegram_bot_token }}
+
+          logging:
+            version: 1
+            formatters:
+              precise:
+                format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+            handlers:
+              file:
+                class: logging.handlers.TimedRotatingFileHandler
+                formatter: precise
+                filename: /var/log/mautrix-telegram/mautrix-telegram.log
+                when: midnight
+                backupCount: 7
+                encoding: utf8
+            root:
+              handlers: [file]
+              level: INFO
+      notify: Restart mautrix-telegram
+      when: enable_telegram_bridge | default(false) | bool
+
+    - name: Deploy Synapse appservice registration for Telegram bridge
+      ansible.builtin.copy:
+        dest: "{{ synapse_config_dir }}/telegram-registration.yaml"
+        owner: synapse
+        group: synapse
+        mode: "0640"
+        content: |
+          id: telegram
+          as_token: "{{ mautrix_telegram_as_token }}"
+          hs_token: "{{ mautrix_telegram_hs_token }}"
+          namespaces:
+            users:
+              - exclusive: true
+                regex: '@telegram_.+:{{ domain_name | regex_escape }}'
+              - exclusive: false
+                regex: '@telegrambot:{{ domain_name | regex_escape }}'
+            aliases:
+              - exclusive: true
+                regex: '#telegram_.+:{{ domain_name | regex_escape }}'
+          url: http://127.0.0.1:29317
+          sender_localpart: telegrambot
+          rate_limited: false
+      notify: Restart Matrix Synapse
+      when: enable_telegram_bridge | default(false) | bool
+
+    - name: Deploy mautrix-telegram rc.d script
+      ansible.builtin.copy:
+        dest: /usr/local/etc/rc.d/mautrix_telegram
+        mode: "0755"
+        content: |
+          #!/bin/sh
+
+          # PROVIDE: mautrix_telegram
+          # REQUIRE: postgresql synapse
+          # KEYWORD: shutdown
+
+          . /etc/rc.subr
+
+          name=mautrix_telegram
+          rcvar=mautrix_telegram_enable
+
+          load_rc_config $name
+
+          : ${mautrix_telegram_enable:="NO"}
+          : ${mautrix_telegram_user:="mautrix-telegram"}
+          : ${mautrix_telegram_config:="/usr/local/etc/mautrix-telegram/config.yaml"}
+          : ${mautrix_telegram_pidfile:="/var/run/mautrix-telegram/mautrix-telegram.pid"}
+
+          pidfile="${mautrix_telegram_pidfile}"
+
+          start_cmd="${name}_start"
+          stop_cmd="${name}_stop"
+
+          mautrix_telegram_start()
+          {
+              if [ -f "${pidfile}" ] && kill -0 $(cat "${pidfile}") 2>/dev/null; then
+                  echo "${name} already running."
+                  return 0
+              fi
+              echo "Starting ${name}."
+              /usr/sbin/daemon -P ${pidfile} -r -f \
+                  /usr/local/bin/sudo -u ${mautrix_telegram_user} \
+                  /var/db/mautrix-telegram/venv/bin/python -m mautrix_telegram \
+                  -c ${mautrix_telegram_config}
+          }
+
+          mautrix_telegram_stop()
+          {
+              if [ -f "${pidfile}" ]; then
+                  echo "Stopping ${name}."
+                  kill $(cat "${pidfile}") 2>/dev/null
+                  rm -f "${pidfile}"
+              else
+                  echo "${name} is not running."
+              fi
+          }
+
+          run_rc_command "$1"
+      when: enable_telegram_bridge | default(false) | bool
+
+    - name: Enable mautrix-telegram service
+      community.general.sysrc:
+        name: mautrix_telegram_enable
+        value: "YES"
+      when: enable_telegram_bridge | default(false) | bool
+
+    - name: Start mautrix-telegram
+      ansible.builtin.service:
+        name: mautrix_telegram
+        state: started
+      when: enable_telegram_bridge | default(false) | bool
 
     # ============================================
     # Caddy Configuration
@@ -425,19 +668,39 @@
       register: synapse_health
       failed_when: "'versions' not in synapse_health.content"
 
+    - name: Wait for mautrix-telegram
+      ansible.builtin.wait_for:
+        port: 29317
+        host: 127.0.0.1
+        timeout: 30
+      when: enable_telegram_bridge | default(false) | bool
+      ignore_errors: true
+      register: mautrix_wait
+
+    - name: Warn if mautrix-telegram not ready
+      ansible.builtin.debug:
+        msg: "WARNING: mautrix-telegram did not start on :29317 within 30s. Check logs: /var/log/mautrix-telegram/"
+      when:
+        - enable_telegram_bridge | default(false) | bool
+        - mautrix_wait is failed
+
     - name: Deployment summary
       ansible.builtin.debug:
         msg: |
           ✓ Matrix Synapse deployed!
-          
+
           Server name: {{ domain_name }}
           Service URL: https://{{ synapse_hostname }}
           User ID format: @user:{{ domain_name }}
-          
+          {% if enable_telegram_bridge | default(false) | bool %}
+          Telegram bridge: http://127.0.0.1:29317
+          Bridge bot: @telegrambot:{{ domain_name }}
+          {% endif %}
+
           Create admin:
             ssh {{ server_ip }}
             register_new_matrix_user -c {{ synapse_config_dir }}/homeserver.yaml http://localhost:8008
-          
+
           Test federation:
             curl https://{{ synapse_hostname }}/.well-known/matrix/server
 
@@ -455,4 +718,9 @@
     - name: Restart Caddy
       ansible.builtin.service:
         name: caddy
+        state: restarted
+
+    - name: Restart mautrix-telegram
+      ansible.builtin.service:
+        name: mautrix_telegram
         state: restarted
