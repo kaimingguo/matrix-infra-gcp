@@ -353,6 +353,31 @@
         name: synapse_enable
         value: "YES"
 
+    - name: Deploy Synapse appservice registration for Telegram bridge
+      ansible.builtin.copy:
+        dest: "{{ synapse_config_dir }}/telegram-registration.yaml"
+        owner: synapse
+        group: synapse
+        mode: "0640"
+        content: |
+          id: telegram
+          as_token: "{{ mautrix_telegram_as_token }}"
+          hs_token: "{{ mautrix_telegram_hs_token }}"
+          namespaces:
+            users:
+              - exclusive: true
+                regex: '@telegram_.+:{{ domain_name | regex_escape }}'
+              - exclusive: false
+                regex: '@telegrambot:{{ domain_name | regex_escape }}'
+            aliases:
+              - exclusive: true
+                regex: '#telegram_.+:{{ domain_name | regex_escape }}'
+          url: http://127.0.0.1:29317
+          sender_localpart: telegrambot
+          rate_limited: false
+      notify: Restart Matrix Synapse
+      when: enable_telegram_bridge | default(false) | bool
+
     - name: Start Matrix Synapse
       ansible.builtin.service:
         name: synapse
@@ -368,6 +393,7 @@
           - py311-pillow
           - py311-cryptography
           - py311-cffi
+          - cmake
           - file
           - ffmpeg
         state: present
@@ -474,31 +500,6 @@
       notify: Restart mautrix-telegram
       when: enable_telegram_bridge | default(false) | bool
 
-    - name: Deploy Synapse appservice registration for Telegram bridge
-      ansible.builtin.copy:
-        dest: "{{ synapse_config_dir }}/telegram-registration.yaml"
-        owner: synapse
-        group: synapse
-        mode: "0640"
-        content: |
-          id: telegram
-          as_token: "{{ mautrix_telegram_as_token }}"
-          hs_token: "{{ mautrix_telegram_hs_token }}"
-          namespaces:
-            users:
-              - exclusive: true
-                regex: '@telegram_.+:{{ domain_name | regex_escape }}'
-              - exclusive: false
-                regex: '@telegrambot:{{ domain_name | regex_escape }}'
-            aliases:
-              - exclusive: true
-                regex: '#telegram_.+:{{ domain_name | regex_escape }}'
-          url: http://127.0.0.1:29317
-          sender_localpart: telegrambot
-          rate_limited: false
-      notify: Restart Matrix Synapse
-      when: enable_telegram_bridge | default(false) | bool
-
     - name: Deploy mautrix-telegram rc.d script
       ansible.builtin.copy:
         dest: /usr/local/etc/rc.d/mautrix_telegram
@@ -565,6 +566,7 @@
         name: mautrix_telegram
         state: started
       when: enable_telegram_bridge | default(false) | bool
+      ignore_errors: true
 
     # ============================================
     # Caddy Configuration

@@ -25,7 +25,7 @@ variable "machine_type" {
 variable "data_disk_size" {
   description = "Data disk size in GB"
   type        = number
-  default     = 30
+  default     = 15
 }
 
 variable "network_tier" {

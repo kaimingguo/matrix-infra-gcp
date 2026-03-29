@@ -142,7 +142,7 @@ resource "google_compute_instance" "matrix" {
   boot_disk {
     initialize_params {
       image = "freebsd-org-cloud-dev/freebsd-15-0-release-amd64-zfs"
-      size  = 22
+      size  = 35
     }
   }
 
@@ -215,6 +215,7 @@ resource "google_storage_bucket" "backups" {
   name          = "matrix-backups-${var.gcp_project_id}"
   location      = var.region
   storage_class = "STANDARD"
+  force_destroy = true
 
   uniform_bucket_level_access = true
 
