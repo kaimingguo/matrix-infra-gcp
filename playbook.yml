@@ -35,6 +35,8 @@
         - { secret: matrix-mautrix-telegram-db-password, var: mautrix_telegram_db_password }
         - { secret: matrix-mautrix-telegram-as-token, var: mautrix_telegram_as_token }
         - { secret: matrix-mautrix-telegram-hs-token, var: mautrix_telegram_hs_token }
+        - { secret: matrix-hermes-as-token, var: hermes_as_token }
+        - { secret: matrix-hermes-hs-token, var: hermes_hs_token }
         - { secret: matrix-telegram-api-id, var: telegram_api_id }
         - { secret: matrix-telegram-api-hash, var: telegram_api_hash }
         - { secret: matrix-telegram-bot-token, var: telegram_bot_token }
@@ -296,12 +298,13 @@
           # Caching (reduced for low memory)
           caches:
             global_factor: 0.5
-          {% if enable_telegram_bridge | default(false) | bool %}
 
-          # Bridge appservice registrations
+          # Appservice registrations
           app_service_config_files:
+          {% if enable_telegram_bridge | default(false) | bool %}
             - {{ synapse_config_dir }}/telegram-registration.yaml
           {% endif %}
+            - {{ synapse_config_dir }}/hermes-registration.yaml
       notify: Restart Matrix Synapse
 
     - name: Check if signing key exists
@@ -377,6 +380,55 @@
           rate_limited: false
       notify: Restart Matrix Synapse
       when: enable_telegram_bridge | default(false) | bool
+
+    - name: Deploy Synapse appservice registration for Hermes agent
+      ansible.builtin.copy:
+        dest: "{{ synapse_config_dir }}/hermes-registration.yaml"
+        owner: synapse
+        group: synapse
+        mode: "0640"
+        content: |
+          id: hermes
+          as_token: "{{ hermes_as_token }}"
+          hs_token: "{{ hermes_hs_token }}"
+          namespaces:
+            users:
+              - exclusive: true
+                regex: '@hermes_.+:{{ domain_name | regex_escape }}'
+              - exclusive: true
+                regex: '@hermes:{{ domain_name | regex_escape }}'
+            aliases:
+              - exclusive: true
+                regex: '#hermes_.+:{{ domain_name | regex_escape }}'
+          url: http://127.0.0.1:29318
+          sender_localpart: hermes
+          rate_limited: false
+      notify: Restart Matrix Synapse
+
+    - name: Create Hermes agent config directory
+      ansible.builtin.file:
+        path: /usr/local/etc/hermes
+        state: directory
+        owner: root
+        group: wheel
+        mode: "0750"
+
+    - name: Provide access token to Hermes agent
+      ansible.builtin.copy:
+        dest: /usr/local/etc/hermes/env
+        owner: root
+        group: wheel
+        mode: "0640"
+        content: |
+          # Credentials for the Hermes appservice agent.
+          # The agent authenticates to Synapse using its appservice token as the
+          # access token (Authorization: Bearer + ?user_id=@hermes:{{ domain_name }}).
+          HERMES_HOMESERVER=http://127.0.0.1:8008
+          HERMES_DOMAIN={{ domain_name }}
+          HERMES_USER_ID=@hermes:{{ domain_name }}
+          HERMES_ACCESS_TOKEN={{ hermes_as_token }}
+          HERMES_HS_TOKEN={{ hermes_hs_token }}
+          HERMES_PORT=29318
 
     - name: Start Matrix Synapse
       ansible.builtin.service:
