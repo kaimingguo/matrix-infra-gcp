@@ -40,16 +40,6 @@ resource "random_password" "mautrix_telegram_hs_token" {
   special = false
 }
 
-resource "random_password" "hermes_as_token" {
-  length  = 64
-  special = false
-}
-
-resource "random_password" "hermes_hs_token" {
-  length  = 64
-  special = false
-}
-
 locals {
   synapse_hostname = "${var.subdomain}.${var.domain_name}"
   secrets = {
@@ -60,8 +50,6 @@ locals {
     mautrix_telegram_db_password       = random_password.mautrix_telegram_db_password.result
     mautrix_telegram_as_token          = random_password.mautrix_telegram_as_token.result
     mautrix_telegram_hs_token          = random_password.mautrix_telegram_hs_token.result
-    hermes_as_token                    = random_password.hermes_as_token.result
-    hermes_hs_token                    = random_password.hermes_hs_token.result
     telegram_api_id                    = coalesce(var.telegram_api_id, "PLACEHOLDER")
     telegram_api_hash                  = coalesce(var.telegram_api_hash, "PLACEHOLDER")
     telegram_bot_token                 = coalesce(var.telegram_bot_token, "PLACEHOLDER")
